@@ -1,0 +1,79 @@
+#!/bin/sh
+
+if [ "$#" -ne 4 ]
+then
+    echo "Usage: $0 <source ip> <platform> <site> <local mysql password>"
+    exit 1
+fi
+
+aegir_dir="/var/aegir"
+source=$1
+platform=$2
+site=$3
+mysqlpass=$4
+
+platform_dir="${aegir_dir}/platforms/${platform}"
+if [ -e "$platform_dir" ]
+then
+    echo "Platform already exists locally (${platform_dir})"
+    exit 2
+fi
+
+site_dir="${platform_dir}/site/${site}"
+if [ -e "$site_dir" ]
+then
+    echo "Site already exists locally (${site_dir})"
+    exit 2
+fi
+
+vhost_file="${aegir_dir}/config/server_master/apache/vhost.d/${site}"
+if [ -e "$vhost_file" ]
+then
+    echo "Site vhost file already exists locally (${vhost_file})"
+    exit 2
+fi
+
+echo "Connecting to remote server to create tarball"
+
+ssh root@"$source" <<EOF
+    echo "> Connected"
+
+    dbname="\`grep -E \"SetEnv[[:space:]]+db_name[[:space:]]+(.*)\" ${vhost_file} | awk '{print \$3}'\`"
+    dbuser="\`grep -E \"SetEnv[[:space:]]+db_user[[:space:]]+(.*)\" ${vhost_file} | awk '{print \$3}'\`"
+    dbpass="\`grep -E \"SetEnv[[:space:]]+db_passwd[[:space:]]+(.*)\" ${vhost_file} | awk '{print \$3}'\`"
+
+    echo "> Dumping database"
+    mysqldump -u\$dbuser -p\$dbpass \$dbname > /tmp/\${dbname}.sql
+
+    echo "> Creating tarball"
+    tar -Pzcf ${platform}-${site}.tar.gz ${platform_dir} /tmp/\${dbname}.sql ${vhost_file}
+
+    echo "> Done"
+    exit
+EOF
+
+echo "Copying tarball"
+scp root@"$source":~/${platform}-${site}.tar.gz /tmp/
+
+echo "Unzipping tarball"
+tar -Pzxf /tmp/${platform}-${site}.tar.gz
+
+dbname="`grep -E "SetEnv[[:space:]]+db_name[[:space:]]+(.*)" ${vhost_file} | awk '{print \$3}'`"
+dbuser="`grep -E "SetEnv[[:space:]]+db_user[[:space:]]+(.*)" ${vhost_file} | awk '{print \$3}'`"
+dbpass="`grep -E "SetEnv[[:space:]]+db_passwd[[:space:]]+(.*)" ${vhost_file} | awk '{print \$3}'`"
+
+echo "Creating database"
+mysql -p${mysqlpass} <<EOF
+    grant all on ${dbname}.* to ${dbuser} identified by '${dbpass}';
+    create database ${dbname};
+    \u ${dbname}
+    \. /tmp/${dbname}.sql
+    quit
+EOF
+
+echo "Setting up in Aegir"
+su aegir <<EOF
+    drush --root='${platform_dir}' --context_type=platform provision-save '@platform_${platform}'
+    drush '@hostmaster' hosting-import '@platform_${platform}'
+    exit
+EOF
